@@ -4,12 +4,9 @@ pub fn build(b: *std.Build) void {
     const mode = b.standardOptimizeOption(.{});
     const target = b.standardTargetOptions(.{});
 
-    b.addModule(.{
-        .name = "serial",
+    const serial_module = b.addModule("serial", .{
         .source_file = .{ .path = "src/serial.zig" },
     });
-
-    const serial_module = b.modules.get("serial") orelse unreachable;
 
     const echo_exe = b.addExecutable(.{
         .name = "serial-echo",
