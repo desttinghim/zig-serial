@@ -15,7 +15,8 @@ pub fn build(b: *std.Build) void {
         .optimize = mode,
     });
     echo_exe.addModule("serial", serial_module);
-    echo_exe.install();
+
+    b.installArtifact(echo_exe);
 
     const list_exe = b.addExecutable(.{
         .name = "serial-list",
@@ -24,5 +25,6 @@ pub fn build(b: *std.Build) void {
         .optimize = mode,
     });
     list_exe.addModule("serial", serial_module);
-    list_exe.install();
+
+    b.installArtifact(list_exe);
 }
