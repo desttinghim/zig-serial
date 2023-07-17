@@ -332,7 +332,7 @@ pub fn configureSerialPort(port: std.fs.File, config: SerialConfig) !void {
                 return error.WindowsError;
 
             // Set timeout between chars to character_timeout converted to milliseconds
-            cto.ReadIntervalTimeout = @intCast(u32, config.character_timeout) * 100;
+            cto.ReadIntervalTimeout = @as(u32, @intCast(config.character_timeout)) * 100;
             // Disable timeout for total length
             cto.ReadTotalTimeoutConstant = 0;
             cto.ReadTotalTimeoutMultiplier = 0;
