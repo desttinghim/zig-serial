@@ -618,6 +618,15 @@ pub const SerialConfig = struct {
 
     /// Defines the handshake protocol used.
     handshake: Handshake = .none,
+
+    /// How many characters to wait for before
+    /// returning from read calls.
+    character_minimum: u8 = 1,
+
+    /// In deci-seconds, length of time to wait
+    /// for before returning from read call. A value of
+    /// zero indicates no timeout.
+    character_timeout: u8 = 0,
 };
 
 const CBAUD = 0o000000010017; //Baud speed mask (not in POSIX).
@@ -682,6 +691,16 @@ pub fn configureSerialPort(port: std.fs.File, config: SerialConfig) !void {
 
             if (SetCommState(port.handle, &dcb) == 0)
                 return error.WindowsError;
+
+            var cto = std.mem.zeroes(COMMTIMEOUTS);
+            if (GetCommTimeouts(port.handle, &cto) == 0)
+                return error.WindowsError;
+
+            // Set timeout between chars to character_timeout converted to milliseconds
+            cto.ReadIntervalTimeout = @as(u32, @intCast(config.character_timeout)) * 100;
+            // Disable timeout for total length
+            cto.ReadTotalTimeoutConstant = 0;
+            cto.ReadTotalTimeoutMultiplier = 0;
         },
         .linux, .macos => |tag| {
             var settings = try std.os.tcgetattr(port.handle);
@@ -741,10 +760,10 @@ pub fn configureSerialPort(port: std.fs.File, config: SerialConfig) !void {
             settings.ispeed = baudmask;
             settings.ospeed = baudmask;
 
-            settings.cc[VMIN] = 1;
+            settings.cc[VMIN] = config.character_minimum;
             settings.cc[VSTOP] = 0x13; // XOFF
             settings.cc[VSTART] = 0x11; // XON
-            settings.cc[VTIME] = 0;
+            settings.cc[VTIME] = config.character_timeout;
 
             try std.os.tcsetattr(port.handle, .NOW, settings);
         },
@@ -1030,8 +1049,18 @@ const DCB = extern struct {
     wReserved1: std.os.windows.WORD,
 };
 
+const COMMTIMEOUTS = extern struct {
+    ReadIntervalTimeout: std.os.windows.DWORD,
+    ReadTotalTimeoutMultiplier: std.os.windows.DWORD,
+    ReadTotalTimeoutConstant: std.os.windows.DWORD,
+    WriteTotalTimeoutMultiplier: std.os.windows.DWORD,
+    WriteTotalTimeoutConstant: std.os.windows.DWORD,
+};
+
 extern "kernel32" fn GetCommState(hFile: std.os.windows.HANDLE, lpDCB: *DCB) callconv(std.os.windows.WINAPI) std.os.windows.BOOL;
 extern "kernel32" fn SetCommState(hFile: std.os.windows.HANDLE, lpDCB: *DCB) callconv(std.os.windows.WINAPI) std.os.windows.BOOL;
+extern "kernel32" fn GetCommTimeouts(hFile: std.os.windows.HANDLE, lpCTO: *COMMTIMEOUTS) callconv(std.os.windows.WINAPI) std.os.windows.BOOL;
+extern "kernel32" fn SetCommTimeouts(hFile: std.os.windows.HANDLE, lpCTO: *COMMTIMEOUTS) callconv(std.os.windows.WINAPI) std.os.windows.BOOL;
 
 /// Only effective on windows.
 ///
