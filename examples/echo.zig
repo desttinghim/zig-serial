@@ -10,7 +10,7 @@ pub fn main() !u8 {
         .parity = .none,
         .stop_bits = .one,
         .handshake = .none,
-    }, .Nonblocking);
+    });
     defer port.close();
 
     while (true) {

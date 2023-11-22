@@ -618,6 +618,15 @@ pub const SerialConfig = struct {
 
     /// Defines the handshake protocol used.
     handshake: Handshake = .none,
+
+    /// Time to wait for bytes before returning a read, in milli-seconds. Timing is not guaranteed.
+    ///
+    /// NOTE: On linux, this value is specified in deci-seconds using a u8, giving a range from 0.1
+    /// seconds to 25.6 with a max precision of one decimal. The passed value will be rounded to the
+    /// next higest integer, to prevent 0 from being passed on values under 100.
+    ///
+    /// Windows works with the milli-second value directly.
+    read_timeout: usize = 100,
 };
 
 const CBAUD = 0o000000010017; //Baud speed mask (not in POSIX).
@@ -643,8 +652,6 @@ pub fn configureSerialPort(port: std.os.fd_t, config: SerialConfig) !void {
                 return error.WindowsError;
 
             var flags = DCBFlags.fromNumeric(dcb.flags);
-
-            // std.log.err("{s} {s}", .{ dcb, flags });
 
             dcb.BaudRate = config.baud_rate;
 
@@ -681,6 +688,25 @@ pub fn configureSerialPort(port: std.os.fd_t, config: SerialConfig) !void {
             dcb.wReserved1 = 0;
 
             if (SetCommState(port, &dcb) == 0)
+                return error.WindowsError;
+
+            // Timeouts
+            var cto = std.mem.zeroes(COMMTIMEOUTS);
+            if (GetCommTimeouts(port, &cto) == 0)
+                return error.WindowsError;
+
+            // If set to MAXDWORD (maximum value that fits in a u32), immediately returns with buffered values
+            cto.ReadIntervalTimeout = std.math.maxInt(std.os.windows.DWORD);
+
+            // Disable timeout for total length
+            cto.ReadTotalTimeoutConstant = config.read_timeout;
+            cto.ReadTotalTimeoutMultiplier = 0;
+
+            // Write timeout must be non-zero or it will block when the write buffer is full.
+            cto.WriteTotalTimeoutConstant = 1;
+            cto.WriteTotalTimeoutMultiplier = 0;
+
+            if (SetCommTimeouts(port, &cto) == 0)
                 return error.WindowsError;
         },
         .linux, .macos => |tag| {
@@ -741,84 +767,12 @@ pub fn configureSerialPort(port: std.os.fd_t, config: SerialConfig) !void {
             settings.ispeed = baudmask;
             settings.ospeed = baudmask;
 
-            // settings.cc[VMIN] = conf.minimum_characters;
+            const timeout: u8 = if (config.read_timeout == 0) 0 else @intCast(config.read_timeout * 2 / 100 / 2);
+
+            settings.cc[VMIN] = 1;
             settings.cc[VSTOP] = 0x13; // XOFF
             settings.cc[VSTART] = 0x11; // XON
-
-            try std.os.tcsetattr(port, .NOW, settings);
-        },
-        else => @compileError("unsupported OS, please implement!"),
-    }
-}
-
-const TimeoutConfig = union(enum) {
-    Nonblocking,
-    Custom: struct {
-        /// How long to wait between recieving characters before timing out
-        read_interval: u8 = 1,
-
-        read_multiplier: u8 = 0,
-
-        /// In deci-seconds, length of time to wait
-        /// for before returning from read call. A value of
-        /// zero indicates no timeout.
-        read_constant: u8 = 0,
-
-        /// Timeout multiplied by the number of characters in
-        /// a message before being summed with write_constant.
-        write_multiplier: u8 = 0,
-
-        /// Timeout length in milliseconds, summed with write_per_character * message length
-        write_constant: u8 = 10,
-    },
-};
-
-pub fn configureTimeouts(port: std.os.fd_t, config: TimeoutConfig) !void {
-    switch (builtin.os.tag) {
-        .windows => {
-            var cto = std.mem.zeroes(COMMTIMEOUTS);
-            if (GetCommTimeouts(port, &cto) == 0)
-                return error.WindowsError;
-
-            switch (config) {
-                .Nonblocking => {
-                    // If set to MAXDWORD (maximum value that fits in a u32), immediately returns with buffered values
-                    cto.ReadIntervalTimeout = std.math.maxInt(std.os.windows.DWORD);
-
-                    // Disable timeout for total length
-                    cto.ReadTotalTimeoutConstant = 0;
-                    cto.ReadTotalTimeoutMultiplier = 0;
-
-                    // Write timeout must be non-zero or it will block when the write buffer is full.
-                    cto.WriteTotalTimeoutConstant = 1;
-                    cto.WriteTotalTimeoutMultiplier = 0;
-                },
-                .Custom => |conf| {
-                    // Set timeout between chars to character_timeout converted to milliseconds
-                    cto.ReadIntervalTimeout = @as(u32, @intCast(conf.read_interval)) * 100;
-
-                    cto.ReadTotalTimeoutConstant = conf.read_constant;
-                    cto.ReadTotalTimeoutMultiplier = conf.read_multiplier;
-
-                    cto.WriteTotalTimeoutConstant = conf.write_constant;
-                    cto.WriteTotalTimeoutMultiplier = conf.write_multiplier;
-                },
-            }
-
-            if (SetCommTimeouts(port, &cto) == 0)
-                return error.WindowsError;
-        },
-        .linux, .macos => {
-            var settings = try std.os.tcgetattr(port);
-
-            switch (config) {
-                .Nonblocking => {
-                    settings.cc[VTIME] = 0;
-                },
-                .Custom => |conf| {
-                    settings.cc[VTIME] = conf.read_interval;
-                },
-            }
+            settings.cc[VTIME] = timeout;
 
             try std.os.tcsetattr(port, .NOW, settings);
         },
@@ -1162,7 +1116,7 @@ pub const SerialPort = struct {
     handle: std.os.fd_t,
 
     /// Open the given serial port with the passed configuration
-    pub fn open(port_name: []const u8, serial_config: SerialConfig, timeout_config: TimeoutConfig) !SerialPort {
+    pub fn open(port_name: []const u8, serial_config: SerialConfig) !SerialPort {
         const handle = handle: {
             switch (builtin.os.tag) {
                 .windows => {
@@ -1182,18 +1136,17 @@ pub const SerialPort = struct {
                     );
                     if (handle == std.os.windows.INVALID_HANDLE_VALUE) {
                         const err = std.os.windows.kernel32.GetLastError();
-                        std.log.err("Error: {}", .{err});
-                        return error.WindowsError;
+                        switch (err) {
+                            else => return error.WindowsError,
+                        }
                     }
                     try configureSerialPort(handle, serial_config);
-                    try configureTimeouts(handle, timeout_config);
                     return .{ .handle = handle };
                 },
                 .linux, .macos => {
                     // Examples say to use either NONBLOCK or NDELAY they have the same value
                     const result: std.os.fd_t = try std.os.open(port_name, std.os.linux.O.NONBLOCK, std.os.linux.O.RDWR);
                     try configureSerialPort(result, serial_config);
-                    try configureTimeouts(result, timeout_config);
                     break :handle result;
                 },
                 else => @compileError("unsupported OS, please implement!"),
@@ -1207,11 +1160,8 @@ pub const SerialPort = struct {
     /// Close the serial port
     pub fn close(port: SerialPort) void {
         switch (builtin.os.tag) {
-            .windows => {
-                std.os.windows.CloseHandle(port.handle);
-            },
-            .linux => {
-                std.os.linux.close(port.handle);
+            .windows, .linux => {
+                std.os.close(port.handle);
             },
             else => @compileError("unsupported OS, please implement!"),
         }
@@ -1261,11 +1211,6 @@ pub const SerialPort = struct {
         try flushSerialPort(port.handle, input, output);
     }
 
-    pub const ReadError = error{
-        ReadTimeout,
-        WindowsError,
-    };
-
     pub const ReadStatus = struct {
         bytesRead: usize = 0,
     };
@@ -1273,7 +1218,7 @@ pub const SerialPort = struct {
     /// Reads bytes from the serial port into the passed buffer and returns a slice of the read bytes.
     /// May return fewer bytes than the size of the buffer passed depending on configuration.
     /// Timing depends on the TimeoutConfig passed to `SerialPort.open()`. See `TimeoutConfig` for details.
-    pub fn read(port: SerialPort, buffer: []u8, status_opt: ?*ReadStatus) ReadError![]u8 {
+    pub fn read(port: SerialPort, buffer: []u8, status_opt: ?*ReadStatus) ![]u8 {
         switch (builtin.os.tag) {
             .windows => {
                 var bytes_read: std.os.windows.DWORD = 0;
@@ -1293,7 +1238,7 @@ pub const SerialPort = struct {
             },
             .linux => {
                 // TODO: detect error conditions
-                const bytes_read = std.os.linux.read(port.handle, buffer.ptr, buffer.len);
+                const bytes_read = try std.os.read(port.handle, buffer);
                 return buffer[0..bytes_read];
             },
             else => @compileError("unsupported OS, please implement!"),
@@ -1303,17 +1248,11 @@ pub const SerialPort = struct {
     /// Reads bytes from the serial port into the passed buffer and returns a slice of the read bytes.
     /// If no bytes are available to read, returns null. Returns only the values immediately and does not
     /// wait to fill the buffer. See `read()` to ensure the buffer is filled.
-    pub fn readAvailableBytes(port: SerialPort, buffer: []u8, status_opt: ?*ReadStatus) ReadError!?[]u8 {
+    pub fn readAvailableBytes(port: SerialPort, buffer: []u8, status_opt: ?*ReadStatus) !?[]u8 {
         const available = try port.getInputBytesAvailable();
         if (available == 0) return null;
         return try port.read(buffer[0..available], status_opt);
     }
-
-    pub const WriteError = error{
-        WriteTimeout,
-        TransferIncomplete,
-        WindowsError,
-    };
 
     pub const WriteStatus = struct {
         bytesWritten: usize = 0,
@@ -1322,7 +1261,7 @@ pub const SerialPort = struct {
     /// Writes bytes from the passed buffer to the serial port. Takes an optional pointer to a status struct.
     /// Returns an error if the bytes cannot be written for any reason. If an error occurs, details can be obtained from the status struct.
     /// If the number of bytes written does not equal the number of bytes passed, an error is returned.
-    pub fn write(port: SerialPort, buffer: []const u8, status_opt: ?*WriteStatus) WriteError!void {
+    pub fn write(port: SerialPort, buffer: []const u8, status_opt: ?*WriteStatus) !void {
         switch (builtin.os.tag) {
             .windows => {
                 var bytes_written: std.os.windows.DWORD = 0;
@@ -1342,8 +1281,7 @@ pub const SerialPort = struct {
                 }
             },
             .linux => {
-                // TODO: detect error states
-                const bytes_written = std.os.linux.write(port.handle, buffer.ptr, buffer.len);
+                const bytes_written = try std.os.write(port.handle, buffer);
                 if (status_opt) |status| {
                     status.bytesWritten = bytes_written;
                 }
