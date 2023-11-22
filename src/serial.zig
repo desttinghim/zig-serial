@@ -618,15 +618,6 @@ pub const SerialConfig = struct {
 
     /// Defines the handshake protocol used.
     handshake: Handshake = .none,
-
-    /// How many characters to wait for before
-    /// returning from read calls.
-    character_minimum: u8 = 1,
-
-    /// In deci-seconds, length of time to wait
-    /// for before returning from read call. A value of
-    /// zero indicates no timeout.
-    character_timeout: u8 = 0,
 };
 
 const CBAUD = 0o000000010017; //Baud speed mask (not in POSIX).
@@ -691,19 +682,6 @@ pub fn configureSerialPort(port: std.os.fd_t, config: SerialConfig) !void {
 
             if (SetCommState(port, &dcb) == 0)
                 return error.WindowsError;
-
-            var cto = std.mem.zeroes(COMMTIMEOUTS);
-            if (GetCommTimeouts(port, &cto) == 0)
-                return error.WindowsError;
-
-            // Set timeout between chars to character_timeout converted to milliseconds
-            cto.ReadIntervalTimeout = @as(u32, @intCast(config.character_timeout)) * 100;
-            // Disable timeout for total length
-            cto.ReadTotalTimeoutConstant = 0;
-            cto.ReadTotalTimeoutMultiplier = 0;
-
-            if (SetCommTimeouts(port, &cto) == 0)
-                return error.WindowsError;
         },
         .linux, .macos => |tag| {
             var settings = try std.os.tcgetattr(port);
@@ -763,10 +741,84 @@ pub fn configureSerialPort(port: std.os.fd_t, config: SerialConfig) !void {
             settings.ispeed = baudmask;
             settings.ospeed = baudmask;
 
-            settings.cc[VMIN] = config.character_minimum;
+            // settings.cc[VMIN] = conf.minimum_characters;
             settings.cc[VSTOP] = 0x13; // XOFF
             settings.cc[VSTART] = 0x11; // XON
-            settings.cc[VTIME] = config.character_timeout;
+
+            try std.os.tcsetattr(port, .NOW, settings);
+        },
+        else => @compileError("unsupported OS, please implement!"),
+    }
+}
+
+const TimeoutConfig = union(enum) {
+    Nonblocking,
+    Custom: struct {
+        /// How long to wait between recieving characters before timing out
+        read_interval: u8 = 1,
+
+        read_multiplier: u8 = 0,
+
+        /// In deci-seconds, length of time to wait
+        /// for before returning from read call. A value of
+        /// zero indicates no timeout.
+        read_constant: u8 = 0,
+
+        /// Timeout multiplied by the number of characters in
+        /// a message before being summed with write_constant.
+        write_multiplier: u8 = 0,
+
+        /// Timeout length in milliseconds, summed with write_per_character * message length
+        write_constant: u8 = 10,
+    },
+};
+
+pub fn configureTimeouts(port: std.os.fd_t, config: TimeoutConfig) !void {
+    switch (builtin.os.tag) {
+        .windows => {
+            var cto = std.mem.zeroes(COMMTIMEOUTS);
+            if (GetCommTimeouts(port, &cto) == 0)
+                return error.WindowsError;
+
+            switch (config) {
+                .Nonblocking => {
+                    // If set to MAXDWORD (maximum value that fits in a u32), immediately returns with buffered values
+                    cto.ReadIntervalTimeout = std.math.maxInt(std.os.windows.DWORD);
+
+                    // Disable timeout for total length
+                    cto.ReadTotalTimeoutConstant = 0;
+                    cto.ReadTotalTimeoutMultiplier = 0;
+
+                    // Write timeout must be non-zero or it will block when the write buffer is full.
+                    cto.WriteTotalTimeoutConstant = 1;
+                    cto.WriteTotalTimeoutMultiplier = 0;
+                },
+                .Custom => |conf| {
+                    // Set timeout between chars to character_timeout converted to milliseconds
+                    cto.ReadIntervalTimeout = @as(u32, @intCast(conf.read_interval)) * 100;
+
+                    cto.ReadTotalTimeoutConstant = conf.read_constant;
+                    cto.ReadTotalTimeoutMultiplier = conf.read_multiplier;
+
+                    cto.WriteTotalTimeoutConstant = conf.write_constant;
+                    cto.WriteTotalTimeoutMultiplier = conf.write_multiplier;
+                },
+            }
+
+            if (SetCommTimeouts(port, &cto) == 0)
+                return error.WindowsError;
+        },
+        .linux, .macos => {
+            var settings = try std.os.tcgetattr(port);
+
+            switch (config) {
+                .Nonblocking => {
+                    settings.cc[VTIME] = 0;
+                },
+                .Custom => |conf| {
+                    settings.cc[VTIME] = conf.read_interval;
+                },
+            }
 
             try std.os.tcsetattr(port, .NOW, settings);
         },
@@ -777,18 +829,18 @@ pub fn configureSerialPort(port: std.os.fd_t, config: SerialConfig) !void {
 /// Flushes the serial port `port`. If `input` is set, all pending data in
 /// the receive buffer is flushed, if `output` is set all pending data in
 /// the send buffer is flushed.
-pub fn flushSerialPort(port: std.fs.File, input: bool, output: bool) !void {
+pub fn flushSerialPort(port: std.os.fd_t, input: bool, output: bool) !void {
     if (!input and !output)
         return;
 
     switch (builtin.os.tag) {
         .windows => {
             const success = if (input and output)
-                PurgeComm(port.handle, PURGE_TXCLEAR | PURGE_RXCLEAR)
+                PurgeComm(port, PURGE_TXCLEAR | PURGE_RXCLEAR)
             else if (input)
-                PurgeComm(port.handle, PURGE_RXCLEAR)
+                PurgeComm(port, PURGE_RXCLEAR)
             else if (output)
-                PurgeComm(port.handle, PURGE_TXCLEAR)
+                PurgeComm(port, PURGE_TXCLEAR)
             else
                 @as(std.os.windows.BOOL, 0);
             if (success == 0)
@@ -796,18 +848,18 @@ pub fn flushSerialPort(port: std.fs.File, input: bool, output: bool) !void {
         },
 
         .linux => if (input and output)
-            try tcflush(port.handle, TCIOFLUSH)
+            try tcflush(port, TCIOFLUSH)
         else if (input)
-            try tcflush(port.handle, TCIFLUSH)
+            try tcflush(port, TCIFLUSH)
         else if (output)
-            try tcflush(port.handle, TCOFLUSH),
+            try tcflush(port, TCOFLUSH),
 
         .macos => if (input and output)
-            try tcflush(port.handle, c.TCIOFLUSH)
+            try tcflush(port, c.TCIOFLUSH)
         else if (input)
-            try tcflush(port.handle, c.TCIFLUSH)
+            try tcflush(port, c.TCIFLUSH)
         else if (output)
-            try tcflush(port.handle, c.TCOFLUSH),
+            try tcflush(port, c.TCOFLUSH),
 
         else => @compileError("unsupported OS, please implement!"),
     }
@@ -818,7 +870,7 @@ pub const ControlPins = struct {
     dtr: ?bool = null,
 };
 
-pub fn changeControlPins(port: std.fs.File, pins: ControlPins) !void {
+pub fn changeControlPins(port: std.fs.fd_t, pins: ControlPins) !void {
     switch (builtin.os.tag) {
         .windows => {
             const CLRDTR = 6;
@@ -827,11 +879,11 @@ pub fn changeControlPins(port: std.fs.File, pins: ControlPins) !void {
             const SETRTS = 3;
 
             if (pins.dtr) |dtr| {
-                if (EscapeCommFunction(port.handle, if (dtr) SETDTR else CLRDTR) == 0)
+                if (EscapeCommFunction(port, if (dtr) SETDTR else CLRDTR) == 0)
                     return error.WindowsError;
             }
             if (pins.rts) |rts| {
-                if (EscapeCommFunction(port.handle, if (rts) SETRTS else CLRRTS) == 0)
+                if (EscapeCommFunction(port, if (rts) SETRTS else CLRRTS) == 0)
                     return error.WindowsError;
             }
         },
@@ -846,7 +898,7 @@ pub fn changeControlPins(port: std.fs.File, pins: ControlPins) !void {
             const TIOCMSET: u32 = 0x5418;
 
             var flags: c_int = 0;
-            if (std.os.linux.ioctl(port.handle, TIOCMGET, @intFromPtr(&flags)) != 0)
+            if (std.os.linux.ioctl(port, TIOCMGET, @intFromPtr(&flags)) != 0)
                 return error.Unexpected;
 
             if (pins.dtr) |dtr| {
@@ -864,7 +916,7 @@ pub fn changeControlPins(port: std.fs.File, pins: ControlPins) !void {
                 }
             }
 
-            if (std.os.linux.ioctl(port.handle, TIOCMSET, @intFromPtr(&flags)) != 0)
+            if (std.os.linux.ioctl(port, TIOCMSET, @intFromPtr(&flags)) != 0)
                 return error.Unexpected;
         },
 
@@ -1103,67 +1155,45 @@ const COMSTAT = extern struct {
 
 extern "kernel32" fn ClearCommError(hFile: std.os.windows.HANDLE, lpErrors: ?*std.os.windows.DWORD, lpStat: ?*COMSTAT) callconv(std.os.windows.WINAPI) std.os.windows.BOOL;
 
-/// Implements non-blocking IO for serial ports
+/// Implements non-blocking IO for serial ports. Not thread-safe.
 /// Uses OS-native APIs to create a file handle with non-blocking reads and writes.
 /// Provides a low-level polling API which can be used as a building block in asynchronous/event-driven APIs.
 pub const SerialPort = struct {
     handle: std.os.fd_t,
 
     /// Open the given serial port with the passed configuration
-    pub fn open(port_name: []const u8, config: SerialConfig) !SerialPort {
+    pub fn open(port_name: []const u8, serial_config: SerialConfig, timeout_config: TimeoutConfig) !SerialPort {
         const handle = handle: {
             switch (builtin.os.tag) {
                 .windows => {
-                    var buffer: [1024]u8 = undefined;
+                    var buffer: [2048]u8 = undefined;
                     var fba = std.heap.FixedBufferAllocator.init(&buffer);
                     const port_name_utf16 = try std.unicode.utf8ToUtf16LeWithNull(fba.allocator(), port_name);
                     std.debug.assert(std.fs.path.isAbsoluteWindowsWTF16(port_name_utf16));
 
-                    // file handle will be stored here
-                    var handle: std.os.windows.HANDLE = undefined;
-                    const path_len_bytes = std.math.cast(u16, port_name_utf16.len * 2) orelse return error.WindowsError;
-                    var nt_name = std.os.windows.UNICODE_STRING{
-                        .Length = path_len_bytes,
-                        .MaximumLength = path_len_bytes,
-                        .Buffer = @constCast(port_name_utf16.ptr),
-                    };
-
-                    var attr = std.os.windows.OBJECT_ATTRIBUTES{
-                        .Length = @sizeOf(std.os.windows.OBJECT_ATTRIBUTES),
-                        .RootDirectory = null,
-                        .Attributes = 0,
-                        .ObjectName = &nt_name,
-                        .SecurityDescriptor = null,
-                        .SecurityQualityOfService = null,
-                    };
-
-                    var io: std.os.windows.IO_STATUS_BLOCK = undefined;
-
-                    const rc = std.os.windows.ntdll.NtCreateFile(
-                        &handle, // FileHandle
-                        std.os.windows.GENERIC_READ | std.os.windows.GENERIC_WRITE, // DesiredAccess
-                        &attr,
-                        &io,
-                        null, // allocation size
-                        std.os.windows.FILE_ATTRIBUTE_NORMAL,
-                        0, // Share access - 0 for exclusive access
-                        std.os.windows.OPEN_EXISTING,
-                        0, // Create options
-                        null,
+                    const handle = std.os.windows.kernel32.CreateFileW(
+                        port_name_utf16,
+                        std.os.windows.GENERIC_READ | std.os.windows.GENERIC_WRITE,
                         0,
+                        null,
+                        std.os.windows.OPEN_EXISTING,
+                        std.os.windows.FILE_ATTRIBUTE_NORMAL,
+                        null,
                     );
-                    switch (rc) {
-                        .SUCCESS => {
-                            try configureSerialPort(handle, config);
-                            break :handle handle;
-                        },
-                        else => return error.WindowsError,
+                    if (handle == std.os.windows.INVALID_HANDLE_VALUE) {
+                        const err = std.os.windows.kernel32.GetLastError();
+                        std.log.err("Error: {}", .{err});
+                        return error.WindowsError;
                     }
+                    try configureSerialPort(handle, serial_config);
+                    try configureTimeouts(handle, timeout_config);
+                    return .{ .handle = handle };
                 },
                 .linux, .macos => {
                     // Examples say to use either NONBLOCK or NDELAY they have the same value
                     const result: std.os.fd_t = try std.os.open(port_name, std.os.linux.O.NONBLOCK, std.os.linux.O.RDWR);
-                    try configureSerialPort(result, config);
+                    try configureSerialPort(result, serial_config);
+                    try configureTimeouts(result, timeout_config);
                     break :handle result;
                 },
                 else => @compileError("unsupported OS, please implement!"),
@@ -1187,17 +1217,17 @@ pub const SerialPort = struct {
         }
     }
 
-    /// Gets the number of bytes waiting in the input buffer in a non-blocking way.
-    pub fn getBytesAvailable(port: SerialPort) !usize {
+    /// Gets the number of bytes waiting in the input buffer
+    pub fn getInputBytesAvailable(port: SerialPort) !usize {
         switch (builtin.os.tag) {
             .windows => {
-                var comstat: COMSTAT = undefined;
+                var comstat: COMSTAT = std.mem.zeroes(COMSTAT);
                 const success = ClearCommError(port.handle, null, &comstat);
                 if (success == 0) {
                     // TODO: Use GetLastError to get more info
                     return error.GetStatusError;
                 }
-                return comstat.bytesInOutputBuffer;
+                return comstat.bytesInInputBuffer;
             },
 
             .linux => {
@@ -1227,16 +1257,42 @@ pub const SerialPort = struct {
         }
     }
 
-    /// Reads bytes from the serial port into the passed buffer and returns a slice of the written bytes.
-    pub fn read(port: SerialPort, buffer: []u8) ![]u8 {
+    pub fn flush(port: SerialPort, input: bool, output: bool) !void {
+        try flushSerialPort(port.handle, input, output);
+    }
+
+    pub const ReadError = error{
+        ReadTimeout,
+        WindowsError,
+    };
+
+    pub const ReadStatus = struct {
+        bytesRead: usize = 0,
+    };
+
+    /// Reads bytes from the serial port into the passed buffer and returns a slice of the read bytes.
+    /// May return fewer bytes than the size of the buffer passed depending on configuration.
+    /// Timing depends on the TimeoutConfig passed to `SerialPort.open()`. See `TimeoutConfig` for details.
+    pub fn read(port: SerialPort, buffer: []u8, status_opt: ?*ReadStatus) ReadError![]u8 {
         switch (builtin.os.tag) {
             .windows => {
                 var bytes_read: std.os.windows.DWORD = 0;
-                if (std.os.windows.kernel32.ReadFile(port.handle, buffer.ptr, @intCast(buffer.len), &bytes_read, null) == 0)
-                    return error.WindowsError;
+                const failure = std.os.windows.kernel32.ReadFile(port.handle, buffer.ptr, @intCast(buffer.len), &bytes_read, null) == 0;
+                if (status_opt) |status| {
+                    status.bytesRead = bytes_read;
+                }
+                if (failure) {
+                    const err = std.os.windows.kernel32.GetLastError();
+                    switch (err) {
+                        .SEM_TIMEOUT => return error.ReadTimeout,
+                        else => return error.WindowsError,
+                    }
+                }
+
                 return buffer[0..bytes_read];
             },
             .linux => {
+                // TODO: detect error conditions
                 const bytes_read = std.os.linux.read(port.handle, buffer.ptr, buffer.len);
                 return buffer[0..bytes_read];
             },
@@ -1244,19 +1300,54 @@ pub const SerialPort = struct {
         }
     }
 
-    /// Writes bytes from the passed buffer to the serial port, returns the number of bytes written.
-    /// If the number of bytes written is less than the length of the buffer, then the message did not finish sending.
-    pub fn write(port: SerialPort, buffer: []const u8) !usize {
+    /// Reads bytes from the serial port into the passed buffer and returns a slice of the read bytes.
+    /// If no bytes are available to read, returns null. Returns only the values immediately and does not
+    /// wait to fill the buffer. See `read()` to ensure the buffer is filled.
+    pub fn readAvailableBytes(port: SerialPort, buffer: []u8, status_opt: ?*ReadStatus) ReadError!?[]u8 {
+        const available = try port.getInputBytesAvailable();
+        if (available == 0) return null;
+        return try port.read(buffer[0..available], status_opt);
+    }
+
+    pub const WriteError = error{
+        WriteTimeout,
+        TransferIncomplete,
+        WindowsError,
+    };
+
+    pub const WriteStatus = struct {
+        bytesWritten: usize = 0,
+    };
+
+    /// Writes bytes from the passed buffer to the serial port. Takes an optional pointer to a status struct.
+    /// Returns an error if the bytes cannot be written for any reason. If an error occurs, details can be obtained from the status struct.
+    /// If the number of bytes written does not equal the number of bytes passed, an error is returned.
+    pub fn write(port: SerialPort, buffer: []const u8, status_opt: ?*WriteStatus) WriteError!void {
         switch (builtin.os.tag) {
             .windows => {
                 var bytes_written: std.os.windows.DWORD = 0;
-                if (std.os.windows.kernel32.WriteFile(port.handle, buffer.ptr, @intCast(buffer.len), &bytes_written, null) == 0)
-                    return error.WindowsError;
-                return bytes_written;
+                const failure = std.os.windows.kernel32.WriteFile(port.handle, buffer.ptr, @intCast(buffer.len), &bytes_written, null) == 0;
+                if (status_opt) |status| {
+                    status.bytesWritten = bytes_written;
+                }
+                if (failure) {
+                    const err = std.os.windows.kernel32.GetLastError();
+                    switch (err) {
+                        .SEM_TIMEOUT => return error.WriteTimeout,
+                        else => return error.WindowsError,
+                    }
+                }
+                if (buffer.len != bytes_written) {
+                    return error.TransferIncomplete;
+                }
             },
             .linux => {
+                // TODO: detect error states
                 const bytes_written = std.os.linux.write(port.handle, buffer.ptr, buffer.len);
-                return bytes_written;
+                if (status_opt) |status| {
+                    status.bytesWritten = bytes_written;
+                }
+                if (bytes_written != buffer.len) return error.TransferIncomplete;
             },
             else => @compileError("unsupported OS, please implement!"),
         }
@@ -1310,10 +1401,10 @@ test "basic flush test" {
     var port = try std.fs.cwd().openFile(tty, .{ .mode = .read_write });
     defer port.close();
 
-    try flushSerialPort(port, true, true);
-    try flushSerialPort(port, true, false);
-    try flushSerialPort(port, false, true);
-    try flushSerialPort(port, false, false);
+    try flushSerialPort(port.handle, true, true);
+    try flushSerialPort(port.handle, true, false);
+    try flushSerialPort(port.handle, false, true);
+    try flushSerialPort(port.handle, false, false);
 }
 
 test "change control pins" {
